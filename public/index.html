@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VoiceDoc AI</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root {
+    --bg: #e8edf0;
+    --panel: #f7f9fa;
+    --ink: #1b2a33;
+    --muted: #5d6e78;
+    --line: #c5d0d6;
+    --accent: #0b6e8a;
+    --accent-ink: #ffffff;
+    --mark: #f6d56a;
+    --danger: #a3261f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .lede { margin: 0 0 24px; color: var(--muted); }
+
+  .drop {
+    display: block; border: 2px dashed var(--accent); border-radius: 10px;
+    background: var(--panel); padding: 28px 20px; text-align: center; cursor: pointer;
+  }
+  .drop.over { background: #e1f0f5; }
+  .drop:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .drop input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .drop strong { color: var(--accent); }
+
+  #setup { display: none; margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  #fileInfo { margin: 0 0 12px; font-weight: 600; word-break: break-word; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+  label { font-size: 0.85rem; color: var(--muted); display: block; margin-bottom: 2px; }
+  input[type=number] { width: 90px; padding: 8px; border: 1px solid var(--line); border-radius: 6px; font: inherit; background: #fff; }
+
+  button {
+    font: inherit; font-weight: 600; padding: 10px 18px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
+  }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+
+  #player { display: none; margin-top: 16px; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .controls label { margin: 0 0 0 auto; display: flex; align-items: center; gap: 6px; }
+  select { font: inherit; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+  progress { width: 100%; height: 8px; margin: 12px 0 4px; accent-color: var(--accent); }
+
+  #status { margin: 8px 0 0; color: var(--muted); min-height: 1.5em; }
+  #status.error { color: var(--danger); font-weight: 600; }
+
+  #reader {
+    margin-top: 16px; max-height: 50vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 20px 22px;
+    font-family: Charter, "Iowan Old Style", Georgia, serif; font-size: 1.1rem; line-height: 1.7;
+  }
+  #reader span { cursor: pointer; border-radius: 3px; padding: 1px 0; }
+  #reader span:hover { background: #dbe7ec; }
+  #reader span.now { background: var(--mark); }
+  #reader span.done { color: var(--muted); }
+  @media (prefers-reduced-motion: no-preference) { #reader { scroll-behavior: smooth; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>VoiceDoc AI</h1>
+  <p class="lede">Upload a PDF and listen to it. Click any passage to jump there.</p>
+
+  <label class="drop" id="drop">
+    <input type="file" id="pdfFile" accept="application/pdf">
+    <span><strong>Choose a PDF</strong> or drop one here</span>
+  </label>
+
+  <section id="setup" aria-live="polite">
+    <p id="fileInfo"></p>
+    <div class="row">
+      <div><label for="fromPage">From page</label><input type="number" id="fromPage" min="1" value="1"></div>
+      <div><label for="toPage">To page</label><input type="number" id="toPage" min="1" value="1"></div>
+      <button id="prepareBtn">Prepare reading</button>
+    </div>
+  </section>
+
+  <section id="player">
+    <div class="controls">
+      <button id="playBtn">Play</button>
+      <button id="prevBtn" class="secondary" aria-label="Previous passage">Back</button>
+      <button id="nextBtn" class="secondary" aria-label="Next passage">Skip</button>
+      <button id="stopBtn" class="secondary">Stop</button>
+      <label>Speed
+        <select id="speed">
+          <option value="0.85">0.85×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+        </select>
+      </label>
+    </div>
+    <progress id="progress" value="0" max="1"></progress>
+    <div id="progressText" class="lede" style="margin:0"></div>
+  </section>
+
+  <p id="status" role="status"></p>
+  <div id="reader" hidden></div>
+</main>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const MAX_CHUNK = 900;       // characters per Watson request (server allows 1500)
+const PREFETCH_AHEAD = 1;    // how many passages to fetch before they're needed
+
+const $ = id => document.getElementById(id);
+const player = new Audio();
+
+let pdfDoc = null;
+let chunks = [];
+let index = 0;
+let state = 'idle';          // idle | playing | paused
+let audioCache = new Map();  // chunk index -> Promise<blobUrl>
+let session = 0;             // bumps on every restart so stale async work is ignored
+
+function setStatus(msg, isError = false) {
+  const el = $('status');
+  el.textContent = msg;
+  el.className = isError ? 'error' : '';
+}
+
+/* ---------- Upload ---------- */
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', ev => { if (ev.dataTransfer.files[0]) loadPDF(ev.dataTransfer.files[0]); });
+$('pdfFile').addEventListener('change', ev => { if (ev.target.files[0]) loadPDF(ev.target.files[0]); });
+
+async function loadPDF(file) {
+  stopAll();
+  $('player').style.display = 'none';
+  $('reader').hidden = true;
+  if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+    return setStatus('That file is not a PDF. Choose a .pdf file.', true);
+  }
+  setStatus('Opening PDF…');
+  try {
+    const data = new Uint8Array(await file.arrayBuffer());
+    pdfDoc = await pdfjsLib.getDocument({ data }).promise;
+    $('fileInfo').textContent = `${file.name} (${pdfDoc.numPages} page${pdfDoc.numPages === 1 ? '' : 's'})`;
+    $('fromPage').max = $('toPage').max = pdfDoc.numPages;
+    $('fromPage').value = 1;
+    $('toPage').value = pdfDoc.numPages;
+    $('setup').style.display = 'block';
+    setStatus('Choose a page range, then prepare the reading.');
+  } catch (err) {
+    console.error(err);
+    pdfDoc = null;
+    $('setup').style.display = 'none';
+    setStatus('Could not open this PDF. It may be damaged or password-protected.', true);
+  }
+}
+
+/* ---------- Text extraction and chunking ---------- */
+async function extractText(from, to) {
+  let text = '';
+  for (let p = from; p <= to; p++) {
+    setStatus(`Reading page ${p} of ${to}…`);
+    const page = await pdfDoc.getPage(p);
+    const content = await page.getTextContent();
+    text += content.items.map(i => i.str).join(' ') + '\n\n';
+  }
+  return text.replace(/[ \t]+/g, ' ').replace(/\s*\n\s*\n\s*/g, '\n\n').trim();
+}
+
+function splitIntoChunks(text, max = MAX_CHUNK) {
+  const sentences = text.replace(/\n+/g, ' ').match(/[^.!?]+[.!?]+["')\]]*\s*|[^.!?]+$/g) || [text];
+  const out = [];
+  let cur = '';
+  for (let s of sentences) {
+    s = s.trim();
+    if (!s) continue;
+    // A single very long sentence: break on spaces.
+    while (s.length > max) {
+      let cut = s.lastIndexOf(' ', max);
+      if (cut < max * 0.5) cut = max;
+      if (cur) { out.push(cur); cur = ''; }
+      out.push(s.slice(0, cut).trim());
+      s = s.slice(cut).trim();
+    }
+    if ((cur + ' ' + s).trim().length > max) { out.push(cur); cur = s; }
+    else cur = (cur + ' ' + s).trim();
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+$('prepareBtn').addEventListener('click', async () => {
+  if (!pdfDoc) return;
+  stopAll();
+  let from = parseInt($('fromPage').value, 10) || 1;
+  let to = parseInt($('toPage').value, 10) || pdfDoc.numPages;
+  from = Math.max(1, Math.min(from, pdfDoc.numPages));
+  to = Math.max(from, Math.min(to, pdfDoc.numPages));
+  $('prepareBtn').disabled = true;
+  try {
+    const text = await extractText(from, to);
+    if (text.replace(/\s/g, '').length < 20) {
+      setStatus('No readable text found. This looks like a scanned PDF (images only). Run OCR on it first, then try again.', true);
+      return;
+    }
+    chunks = splitIntoChunks(text);
+    index = 0;
+    renderReader();
+    $('player').style.display = 'block';
+    updateProgress();
+    const chars = chunks.reduce((n, c) => n + c.length, 0);
+    setStatus(`Ready: ${chars.toLocaleString()} characters in ${chunks.length} passages. They will be sent to IBM Watson as you listen.`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Something went wrong while reading the PDF.', true);
+  } finally {
+    $('prepareBtn').disabled = false;
+  }
+});
+
+/* ---------- Reader pane ---------- */
+function renderReader() {
+  const box = $('reader');
+  box.hidden = false;
+  box.textContent = '';
+  chunks.forEach((c, i) => {
+    const span = document.createElement('span');
+    span.textContent = c + ' ';
+    span.dataset.i = i;
+    span.addEventListener('click', () => jumpTo(i));
+    box.appendChild(span);
+  });
+  highlight();
+}
+
+function highlight() {
+  [...$('reader').children].forEach((el, i) => {
+    el.classList.toggle('now', i === index && state !== 'idle');
+    el.classList.toggle('done', i < index);
+  });
+  const now = $('reader').children[index];
+  if (now && state !== 'idle') now.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function updateProgress() {
+  $('progress').max = Math.max(chunks.length, 1);
+  $('progress').value = index;
+  $('progressText').textContent = chunks.length ? `Passage ${Math.min(index + 1, chunks.length)} of ${chunks.length}` : '';
+}
+
+/* ---------- Audio from the backend ---------- */
+function fetchAudio(i) {
+  if (audioCache.has(i)) return audioCache.get(i);
+  const p = (async () => {
+    const res = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: chunks[i] })
+    });
+    if (!res.ok) {
+      let msg = `Server error ${res.status}`;
+      try { msg = (await res.json()).error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    return URL.createObjectURL(await res.blob());
+  })();
+  p.catch(() => audioCache.delete(i)); // allow retry after a failure
+  audioCache.set(i, p);
+  return p;
+}
+
+function prefetch(from) {
+  for (let k = 1; k <= PREFETCH_AHEAD; k++) {
+    if (from + k < chunks.length) fetchAudio(from + k).catch(() => {});
+  }
+}
+
+async function playChunk(i) {
+  const mySession = session;
+  if (i >= chunks.length) {
+    state = 'idle';
+    index = 0;
+    $('playBtn').textContent = 'Play';
+    updateProgress(); highlight();
+    return setStatus('Finished.');
+  }
+  index = i;
+  state = 'playing';
+  $('playBtn').textContent = 'Pause';
+  updateProgress(); highlight();
+  setStatus('Loading audio…');
+  try {
+    const url = await fetchAudio(i);
+    if (mySession !== session) return;
+    player.src = url;
+    player.playbackRate = parseFloat($('speed').value);
+    await player.play();
+    if (mySession !== session) return;
+    setStatus('Playing…');
+    prefetch(i);
+  } catch (err) {
+    if (mySession !== session) return;
+    console.error(err);
+    state = 'paused';
+    $('playBtn').textContent = 'Play';
+    setStatus(`Could not get audio: ${err.message}`, true);
+  }
+}
+
+player.addEventListener('ended', () => { if (state === 'playing') playChunk(index + 1); });
+
+function jumpTo(i) {
+  session++;
+  player.pause();
+  playChunk(i);
+}
+
+function stopAll() {
+  session++;
+  player.pause();
+  player.removeAttribute('src');
+  state = 'idle';
+  index = 0;
+  for (const p of audioCache.values()) p.then(URL.revokeObjectURL).catch(() => {});
+  audioCache = new Map();
+  $('playBtn').textContent = 'Play';
+  if (chunks.length) { updateProgress(); highlight(); }
+}
+
+/* ---------- Controls ---------- */
+$('playBtn').addEventListener('click', () => {
+  if (!chunks.length) return;
+  if (state === 'playing') {
+    player.pause(); state = 'paused';
+    $('playBtn').textContent = 'Play'; setStatus('Paused.');
+  } else if (state === 'paused' && player.src) {
+    state = 'playing'; $('playBtn').textContent = 'Pause';
+    player.play().then(() => setStatus('Playing…')).catch(() => jumpTo(index));
+  } else {
+    jumpTo(index);
+  }
+});
+$('nextBtn').addEventListener('click', () => chunks.length && jumpTo(Math.min(index + 1, chunks.length - 1)));
+$('prevBtn').addEventListener('click', () => chunks.length && jumpTo(Math.max(index - 1, 0)));
+$('stopBtn').addEventListener('click', () => { stopAll(); setStatus('Stopped.'); });
+$('speed').addEventListener('change', () => { player.playbackRate = parseFloat($('speed').value); });
+</script>
+</body>
+</html>
